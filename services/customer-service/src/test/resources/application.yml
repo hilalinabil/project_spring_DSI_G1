@@ -1,0 +1,22 @@
+# Test copy of src/main/resources/application.yml (same name, so it replaces it
+# on the test classpath). Tests run without a Config Server or Eureka: there is
+# no configserver: import here, and the values that normally come from the
+# ticketFlow-config repo are given inline.
+spring:
+  application:
+    name: customer-service
+  cloud:
+    config:
+      enabled: false
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: create-drop
+  h2:
+    console:
+      enabled: true
+eureka:
+  client:
+    enabled: false
+ticketflow:
+  message: "Message from test properties"

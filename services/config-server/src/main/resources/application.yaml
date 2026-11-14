@@ -1,0 +1,29 @@
+server:
+  port: 8888
+spring:
+  application:
+    name: config-server
+  config:
+    # Reads CONFIG_GIT_URI (and CONFIG_GIT_USERNAME / CONFIG_GIT_TOKEN) from the
+    # repo-root .env file: the first path works when started from the repo root,
+    # the second from services/config-server (./mvnw -pl ... spring-boot:run).
+    # optional: because CI / Docker set real environment variables instead,
+    # and those always take precedence over this file.
+    import: "optional:file:.env[.properties],optional:file:../../.env[.properties]"
+  cloud:
+    config:
+      server:
+        git:
+          uri: ${CONFIG_GIT_URI}
+          default-label: main
+          try-master-branch: false
+          clone-on-start: true
+          refresh-rate: 0
+          # private repo only:
+          # username: ${CONFIG_GIT_USERNAME}
+          # password: ${CONFIG_GIT_TOKEN}
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
