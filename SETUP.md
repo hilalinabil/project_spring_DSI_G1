@@ -1,258 +1,491 @@
-# TicketFlow: setup guide for collaborators
+# TicketFlow
 
-This guide takes you from a fresh clone to the full TicketFlow stack running
-on your machine (7 containers), and explains the team rules.
+TicketFlow is an event ticketing platform built as a **Spring Boot / Spring Cloud microservices** system. Users can browse events, manage customer accounts, and book seats. Each business domain runs as an independent service with its own database. All services run in Docker containers, and their configuration is centralized in a Git repository.
 
+> Academic project for the *Architecture microservices* course (Pr. AHAIDOUS, 2026/2027), built against the TicketFlow *cahier des charges* and the course labs TP1 to TP4.
+ 
 ---
 
-## 1. Prerequisites
+## Table of contents
 
-| Tool | Version | Needed for |
-|---|---|---|
-| Git | any recent | cloning, branches |
-| Docker + Docker Compose v2 | Docker 24+ (`docker compose`, not `docker-compose`) | running the stack |
-| JDK | 21 | running the tests, or a service outside Docker (optional) |
+- [Architecture](#architecture)
+- [Tech stack](#tech-stack)
+- [Services and ports](#services-and-ports)
+- [Project structure](#project-structure)
+- [Getting started](#getting-started)
+- [Centralized configuration](#centralized-configuration)
+- [API reference](#api-reference)
+- [Service-to-service communication (OpenFeign)](#service-to-service-communication-openfeign)
+- [Databases](#databases)
+- [Docker setup](#docker-setup)
+- [Testing](#testing)
+- [Security notes](#security-notes)
+- [Known limitations](#known-limitations)
+- [Roadmap](#roadmap)
+---
 
-You do **not** need Maven: the project ships the Maven wrapper (`./mvnw`).
+## Architecture
 
-These host ports must be **free**:
-
-| Port | Used by |
-|---|---|
-| 8080 | api-gateway (the only public entry point) |
-| 8761 | Eureka dashboard (published on `127.0.0.1` only) |
-| 3306 | MySQL (published on `127.0.0.1` only) |
-
-If you already run a local MySQL on 3306, stop it first.
-
-**Windows users:** use WSL 2 (recommended) or Git Bash, and before cloning run:
-
-```bash
-git config --global core.autocrlf input
+```mermaid
+flowchart LR
+    Client([Client / curl / Angular])
+    GW[API Gateway<br/>:8080]
+    EU[Discovery Server<br/>Eureka :8761]
+    CS[Config Server<br/>:8888]
+    GH[(GitHub<br/>ticketFlow-config)]
+    CUS[customer-service<br/>:8081]
+    EVT[event-service<br/>:8082]
+    BKG[booking-service<br/>:8083]
+    DB[(MySQL 8.4<br/>customer_db · event_db · booking_db)]
+ 
+    Client -->|HTTP| GW
+    GW -->|lb://| CUS
+    GW -->|lb://| EVT
+    GW -->|lb://| BKG
+ 
+    BKG -->|OpenFeign| CUS
+    BKG -->|OpenFeign /internal| EVT
+ 
+    CUS --> DB
+    EVT --> DB
+    BKG --> DB
+ 
+    GH -.-> CS
+    CS -.config.-> GW
+    CS -.config.-> CUS
+    CS -.config.-> EVT
+    CS -.config.-> BKG
+ 
+    GW -.register/lookup.-> EU
+    CUS -.register.-> EU
+    EVT -.register.-> EU
+    BKG -.register/lookup.-> EU
 ```
 
-Otherwise the shell scripts (`mvnw`, `docker/mysql/init/*.sh`) get Windows line
-endings and fail inside the containers.
+There are three separate flows:
 
----
-
-## 2. Access
-
-Ask the repository owner to add you as a collaborator on **both** repositories:
-
-| Repository | Content |
+| Flow | Path |
 |---|---|
-| `hilalinabil/project_spring_DSI_G1` | the application (all microservices, Docker files) |
-| `hilalinabil/ticketFlow-config` | the centralized configuration, read by the config server from GitHub |
-
-You only need to clone the config repository if you plan to change the configuration
-(see [section 7](#7-changing-the-configuration)).
-
+| **Configuration** | GitHub → Config Server :8888 → every client service at startup |
+| **Discovery** | Every service registers with Eureka :8761; the gateway and Feign clients resolve names through it |
+| **Business traffic** | Client → API Gateway :8080 → business service. Internal calls go service to service through Feign, never through the gateway |
+ 
 ---
 
-## 3. First run
+## Tech stack
+
+| Area | Technology |
+|---|---|
+| Language | Java 21 |
+| Framework | Spring Boot 4.0.8 |
+| Cloud | Spring Cloud 2025.1.3 (Gateway Server WebFlux, Netflix Eureka, Config, OpenFeign) |
+| Persistence | Spring Data JPA, Hibernate (`ddl-auto: update`) |
+| Database | MySQL 8.4 (runtime), H2 (tests only) |
+| Build | Maven multi-module (`ticketflow-parent`) with the Maven wrapper |
+| Containers | Docker (multi-stage images), Docker Compose |
+| CI | GitHub Actions (`./mvnw clean verify`) |
+ 
+---
+
+## Services and ports
+
+| Service | Port | Published on host | Role |
+|---|---|---|---|
+| `api-gateway` | 8080 | yes (public entry point) | Single entry point, explicit routes only |
+| `discovery-server` | 8761 | `127.0.0.1` only | Eureka service registry and dashboard |
+| `config-server` | 8888 | no | Serves configuration from the GitHub config repo |
+| `customer-service` | 8081 | no | Customer accounts and profiles |
+| `event-service` | 8082 | no | Event catalogue, publication and seat inventory |
+| `booking-service` | 8083 | no | Bookings; validates customers and reserves seats through Feign |
+| `mysql` | 3306 | `127.0.0.1` only | One server, one database per service |
+
+Business services can only be reached through the gateway. MySQL and Eureka are bound to `127.0.0.1`, so they're reachable from the developer's machine but not from the network.
+ 
+---
+
+## Project structure
+
+```
+ticketflow/
+├── pom.xml                          # ticketflow-parent (BOM, modules)
+├── docker-compose.yml               # whole stack
+├── .env.example                     # template for secrets (copy to .env)
+├── .dockerignore
+├── docker/
+│   └── mysql/init/
+│       └── 01-create-databases.sh   # creates the 3 databases and their users
+└── services/
+    ├── api-gateway/
+    ├── discovery-server/
+    ├── config-server/
+    ├── customer-service/
+    ├── event-service/
+    └── booking-service/
+```
+
+The configuration lives in a **separate repository**, `ticketFlow-config`:
+
+```
+ticketFlow-config/
+├── application.yaml          # shared by all config clients (Eureka URL, prefer-ip-address)
+├── api-gateway.yaml          # gateway port and routes
+├── customer-service.yaml
+├── customer-service-dev.yaml # "dev" profile example
+├── event-service.yaml
+└── booking-service.yaml      # includes Feign timeouts
+```
+
+### Layout of a business service
+
+`event-service` and `booking-service` follow the same layered structure:
+
+```
+com.ticketflow.<service>/
+├── controller/     REST controllers: DTOs in and out, no business logic
+├── dto/            Java records: XxxRequest (validated) and XxxResponse
+├── entity/         JPA entities; they never leave the service layer
+├── repository/     Spring Data JPA repositories
+├── mapper/         hand-written entity <-> DTO mappers
+├── service/        service interfaces (declarations)
+│   └── impl/       service implementations
+├── exception/      domain exceptions + global exception handler
+└── client/         (booking-service) Feign clients
+    └── dto/        records for remote responses
+```
+
+- **DTOs everywhere:** entities are never returned by the API. Each response only carries the fields the caller needs.
+- **Interface and implementation are separate:** controllers depend on the service interface, not on the implementation.
+- **No shared DTO module:** each service owns its records. `booking-service` has its own `EventResponse` and `CustomerResponse` containing only the fields it uses, which keeps the services independent.
+---
+
+## Getting started
+
+### Prerequisites
+
+- Docker and Docker Compose
+- JDK 21 (only to build or run outside Docker)
+- Access to the `ticketFlow-config` GitHub repository
+### 1. Configure secrets
 
 ```bash
-# 1. Clone the application
-git clone git@github.com:hilalinabil/project_spring_DSI_G1.git ticketflow
-cd ticketflow
-
-# 2. Switch to the working branch (until it is merged into main)
-git checkout feature-config
-
-# 3. Create YOUR OWN .env file (git-ignored, never commit it)
 cp .env.example .env
 ```
 
-Edit `.env` and replace every `change-me-*` value with any password you like.
-They are only used on your machine: you do **not** need the owner's passwords.
+Fill in `.env` with real values: the MySQL root password, the per-service database passwords, and `CONFIG_GIT_URI` (the **GitHub URL** of the config repo). `.env` is git-ignored and must never be committed.
 
-```dotenv
-CONFIG_GIT_URI=https://github.com/hilalinabil/ticketFlow-config   # keep as is
-MYSQL_ROOT_PASSWORD=<choose one>
-CUSTOMER_DB_PASSWORD=<choose one>
-EVENT_DB_PASSWORD=<choose one>
-BOOKING_DB_PASSWORD=<choose one>
-```
+> ⚠️ `CONFIG_GIT_URI` must be the GitHub URL. Never point it at a local clone with a `file:` URI: the Config Server would reset that folder and erase unpushed commits.
+
+### 2. Start the stack
 
 ```bash
-# 4. Build the images and start the stack
 docker compose up -d --build
+docker compose ps        # wait until every container is "healthy"
 ```
 
-> The **first build is slow** (about 20 to 30 minutes): every image downloads
-> all its Maven dependencies. Later builds reuse the Docker cache and take
-> seconds to a few minutes.
+Startup order is enforced with health checks:
+
+```
+mysql + config-server → discovery-server → customer-service → event-service → booking-service → api-gateway
+```
+
+### 3. Check that it's running
+
+- Eureka dashboard: <http://localhost:8761>. CUSTOMER-SERVICE, EVENT-SERVICE, BOOKING-SERVICE and API-GATEWAY should be **UP**. The Config Server is intentionally not registered.
+- Gateway routes: `curl http://localhost:8080/actuator/gateway/routes`
+### 4. Stop
 
 ```bash
-# 5. Wait until all 7 containers are "healthy" (about 1 to 2 minutes after start)
-docker compose ps
+docker compose down        # keeps the MySQL data volume
+docker compose down -v     # also deletes the database data
 ```
 
-Expected:
+### Running a service outside Docker
 
-```
-SERVICE            STATUS
-api-gateway        Up (healthy)
-booking-service    Up (healthy)
-config-server      Up (healthy)
-customer-service   Up (healthy)
-discovery-server   Up (healthy)
-event-service      Up (healthy)
-mysql              Up (healthy)
-```
-
-Startup order is automatic: `mysql` + `config-server` → `discovery-server` →
-`customer-service` / `event-service` → `booking-service` / `api-gateway`.
-
----
-
-## 4. Check that everything works
-
-Open the Eureka dashboard: <http://localhost:8761>. You should see
-`CUSTOMER-SERVICE`, `EVENT-SERVICE`, `BOOKING-SERVICE` and `API-GATEWAY` with
-status **UP**. The gateway can take about 30 seconds to discover a service that has just started.
-
-Then run this end-to-end test (everything goes through the gateway on port 8080):
+MySQL is published on `127.0.0.1:3306`, so a service can run locally against the Dockerized database:
 
 ```bash
-# Create a customer -> 201
-curl -i -X POST localhost:8080/api/customers -H 'Content-Type: application/json' \
-  -d '{"firstName":"Sara","lastName":"Idrissi","email":"sara@example.com","phone":"0600000000"}'
-
-# Create an event (DRAFT) -> 201, then publish it -> 200
-curl -i -X POST localhost:8080/api/events -H 'Content-Type: application/json' \
-  -d '{"title":"Gnaoua Night","description":"Live music","venue":"Theatre Mohammed V",
-       "city":"Rabat","startDateTime":"2030-06-20T20:00:00","price":250.00,"capacity":100}'
-curl -X PATCH localhost:8080/api/events/1/publish
-
-# Book 2 seats -> 201, status PENDING_PAYMENT, totalPrice 500.00
-curl -i -X POST localhost:8080/api/bookings -H 'Content-Type: application/json' \
-  -d '{"customerId":1,"eventId":1,"quantity":2}'
-
-# availableSeats is now 98
-curl localhost:8080/api/events/1
-```
-
-(Use the ids returned by your own calls if they are not 1.)
-
----
-
-## 5. Daily commands
-
-```bash
-./mvnw clean verify                              # all tests; no Docker needed (H2 + inline config)
-./mvnw -pl services/booking-service -am verify   # tests of one module only
-
-docker compose ps                                # status of the containers
-docker compose logs -f booking-service           # follow one service's logs
-docker compose up -d --build booking-service     # rebuild + restart one service after a code change
-docker compose restart customer-service          # restart without rebuilding
-
-docker compose down                              # stop everything, KEEPS the MySQL data
-docker compose down -v                           # stop everything AND DELETES the MySQL data
-```
-
----
-
-## 6. Running a service outside Docker (optional, for debugging in the IDE)
-
-MySQL and Eureka stay in Docker; the config server and the service you debug
-run on your machine:
-
-```bash
-docker compose up -d mysql discovery-server
-./mvnw -pl services/config-server spring-boot:run     # terminal 1 (reads CONFIG_GIT_URI from .env)
-
-# terminal 2: database credentials only come from the environment
-export DB_USERNAME=event_user
-export DB_PASSWORD=$(grep ^EVENT_DB_PASSWORD= .env | cut -d= -f2)
+export DB_USERNAME=<service user> DB_PASSWORD=<service password>
 ./mvnw -pl services/event-service spring-boot:run
 ```
 
-Use `customer_user` / `CUSTOMER_DB_PASSWORD` for customer-service and
-`booking_user` / `BOOKING_DB_PASSWORD` for booking-service. Stop the Docker
-container of the same service first (`docker compose stop event-service`),
-otherwise Eureka lists two instances.
-
+All hosts default to `localhost` (`CONFIG_SERVER_URL`, `EUREKA_URL`, `DB_HOST`), so no extra settings are needed locally.
+ 
 ---
 
-## 7. Changing the configuration
+## Centralized configuration
 
-All non-secret settings (ports, datasource URLs, JPA, Feign timeouts, gateway
-routes) live in the **`ticketFlow-config`** repository, branch `main`:
+Every client service keeps only three settings locally: its name, the config import and the Git label. Everything else (ports, datasource, JPA, routes, Feign timeouts) comes from the `ticketFlow-config` repository through the Config Server.
 
-| File | Used by |
-|---|---|
-| `application.yaml` | every service (Eureka URL) |
-| `api-gateway.yaml` | gateway port and routes |
-| `customer-service.yaml`, `event-service.yaml`, `booking-service.yaml` | each service |
+```yaml
+spring:
+  application:
+    name: event-service
+  config:
+    import: "configserver:${CONFIG_SERVER_URL:http://localhost:8888}"
+  cloud:
+    config:
+      label: main
+```
 
-⚠️ **That branch is shared live.** Every collaborator's config server reads it
-from GitHub, so a push to `main` changes **everyone's** running stack.
-Always open a pull request for config changes; never push to `main` directly.
+- The import has **no `optional:` prefix**, so a service refuses to start if its configuration can't be loaded.
+- Host names use placeholders with `localhost` defaults, so the same configuration works inside Docker and on the host.
+- **No secrets** are stored in the config repo. Passwords are referenced as `${DB_PASSWORD}` and come from the environment.
+### Inspect what the Config Server serves
 
-After a config change has been merged, restart the services that use it:
+From inside the Docker network, or with config-server running locally:
 
 ```bash
-docker compose restart config-server event-service   # for example
+curl http://localhost:8888/event-service/default/main
+curl http://localhost:8888/customer-service/dev/main   # "dev" profile
 ```
 
----
+### Refresh a value without restarting
 
-## 8. Team rules
+```bash
+# 1. change ticketflow.message in customer-service.yaml, commit and push
+# 2. ask the running instance to reload its configuration
+curl -X POST http://localhost:8081/actuator/refresh
+curl http://localhost:8081/api/config/message
+```
 
-1. **Never commit `.env`** or any password or token. Secrets live only in your local `.env`.
-2. **Never push to `main`.** Work on a branch, open a pull request; CI runs
-   `./mvnw verify` on every PR and it must be green before merging.
-3. **`./mvnw clean verify` must pass** locally before you open a PR.
-4. **customer-service is frozen:** do not change its Java code, packages, DTOs or tests.
-5. **One database per service:** a service never reads another service's database.
-   Services talk to each other over HTTP (OpenFeign), through Eureka, never through the gateway.
-6. **No shared DTO module:** each service owns its own records (for example, booking-service
-   has its own `client/dto/EventResponse`).
-7. **`CONFIG_GIT_URI` is always the GitHub URL**, never a `file:` URI to a local clone.
-8. New services follow the existing layout (`controller/`, `dto/`, `entity/`, `repository/`,
-   `mapper/`, `service/` + `service/impl/`, `exception/`) and the shared two-stage `Dockerfile`
-   template (copy one, change only the module name and port). When you add a module, also add its
-   `pom.xml` `COPY` line to **every** Dockerfile.
+Only `@RefreshScope` beans pick up the change. Structural settings (ports, datasources, routes) still need a restart.
 
----
+### customer-service in Docker
 
-## 9. Troubleshooting
+customer-service's own files are intentionally left unchanged, and its packaged `application.yml` points at `localhost:8888`. In Docker, Compose replaces that file entirely with four environment variables:
 
-| Symptom | Cause and fix |
+| Variable | Purpose |
 |---|---|
-| `set MYSQL_ROOT_PASSWORD in .env` | `.env` is missing: do step 3 of section 3 |
-| A service is `unhealthy` / restarting, logs show `Access denied for user` | You changed passwords in `.env` after the first start. The MySQL init script only runs on an **empty** volume: `docker compose down -v` then `docker compose up -d` (deletes the data) |
-| `mysql` fails at first start with `$'\r': command not found` | Windows line endings in the init script: set `core.autocrlf input`, delete and re-clone |
-| `port is already allocated` (3306, 8080 or 8761) | Another program uses the port; stop it (for example a local MySQL) |
-| `config-server` never becomes healthy | No internet access to GitHub, or the config repo became private: set `CONFIG_GIT_USERNAME` and `CONFIG_GIT_TOKEN` (your own token) in `.env` |
-| A service starts on the wrong port, or a route returns 404 | The config server could not serve its file: `docker compose logs config-server`, check the file exists on `main` in `ticketFlow-config` |
-| `POST /api/bookings` returns 503 | event-service or customer-service is down: `docker compose ps`, then `docker compose start <service>` |
-| A new route returns 404 just after startup | The gateway hasn't discovered the service yet; wait about 30 s |
-| Everything is broken and you want a clean start | `docker compose down -v && docker compose up -d --build` |
+| `SPRING_CONFIG_LOCATION=optional:file:/app/config/` | Stops the packaged `application.yml` from loading |
+| `SPRING_APPLICATION_NAME=customer-service` | Replaces the name from that file |
+| `SPRING_CLOUD_CONFIG_LABEL=main` | Replaces the Git label |
+| `SPRING_CONFIG_IMPORT=configserver:http://config-server:8888` | Replaces the import, pointing at the config-server container |
 
+As a result, every customer-service setting used in Docker (datasource, `ddl-auto`, `open-in-view`) is defined in `customer-service.yaml` in the config repo.
+ 
 ---
 
-## 10. Service map
+## API reference
 
+All public endpoints are called through the gateway at `http://localhost:8080`.
+
+### Customers: `/api/customers`
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/customers` | Create a customer → `201` + `Location` |
+| GET | `/api/customers` | List customers |
+| GET | `/api/customers/{id}` | Get one customer (`404` if missing) |
+| PUT | `/api/customers/{id}` | Update a customer |
+| DELETE | `/api/customers/{id}` | Delete a customer |
+
+Emails are unique regardless of letter case (duplicate → `409`).
+
+```bash
+curl -i -X POST http://localhost:8080/api/customers \
+  -H 'Content-Type: application/json' \
+  -d '{"firstName":"Salma","lastName":"Alaoui","email":"salma@example.com"}'
 ```
-client ──► api-gateway :8080 ──► customer-service :8081 ──► MySQL customer_db
-                         ├─────► event-service    :8082 ──► MySQL event_db
-                         └─────► booking-service  :8083 ──► MySQL booking_db
-                                      │ OpenFeign (via Eureka)
-                                      ├─► customer-service  GET /api/customers/{id}
-                                      └─► event-service     /internal/events/**  (not routed by the gateway)
 
-discovery-server :8761 (Eureka)      config-server :8888 ──► GitHub ticketFlow-config (main)
+### Events: `/api/events`
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/events` | Create an event in `DRAFT` status → `201` + `Location` |
+| GET | `/api/events?page=0&size=20` | List **published** events (page size 1 to 50, otherwise `400`) |
+| GET | `/api/events/{id}` | Get a published event (`404` if missing or not published) |
+| PATCH | `/api/events/{id}/publish` | `DRAFT` → `PUBLISHED` |
+| PATCH | `/api/events/{id}/close` | `PUBLISHED` → `CLOSED` |
+
+Invalid status transitions return `409`. Drafts are never visible publicly.
+
+```bash
+curl -i -X POST http://localhost:8080/api/events \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"Jazz Night","description":"Live jazz","venue":"Théâtre Mohammed V",
+       "city":"Rabat","startDateTime":"2026-12-20T20:00:00","price":150.00,"capacity":100}'
+ 
+curl -i -X PATCH http://localhost:8080/api/events/1/publish
 ```
 
-| Endpoint group | Paths (via `localhost:8080`) |
+### Bookings: `/api/bookings`
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/bookings` | Create a booking → `201` + `Location` |
+| GET | `/api/bookings/{id}` | Get one booking |
+| GET | `/api/bookings?customerId={id}` | List a customer's bookings (paginated) |
+
+```bash
+curl -i -X POST http://localhost:8080/api/bookings \
+  -H 'Content-Type: application/json' \
+  -d '{"customerId":1,"eventId":1,"quantity":3}'
+```
+
+| Case | Response |
 |---|---|
-| Customers | `POST/GET /api/customers`, `GET/PUT/DELETE /api/customers/{id}` |
-| Events | `POST/GET /api/events`, `GET /api/events/{id}`, `PATCH /api/events/{id}/publish`, `PATCH /api/events/{id}/close` |
-| Bookings | `POST /api/bookings`, `GET /api/bookings/{id}`, `GET /api/bookings?customerId=` |
+| Valid booking | `201`, status `PENDING_PAYMENT`, price snapshot and total |
+| Unknown customer | `404` "customer not found" |
+| Unknown event | `404` "event not found" |
+| Event not published | `409` |
+| Not enough seats | `409` "not enough seats" (seats unchanged) |
+| Quantity outside 1 to 10 | `400` |
+| event-service or customer-service unavailable | `503` |
 
-Errors are always JSON: `{"status","error","message","path","timestamp"}`
-(400 invalid input, 404 not found, 409 business conflict, 503 dependency unavailable).
+> `customerId` in the request body is temporary. Once authentication (Keycloak/JWT) is added, the customer's identity will come from the token.
+
+### Internal endpoints (not routed by the gateway)
+
+Used only by `booking-service`. They return `404` when called through `:8080`.
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/internal/events/{id}` | Status, available seats and price |
+| POST | `/internal/events/{id}/reservations` | Reserve seats atomically → `409` if not enough seats or not published |
+| POST | `/internal/events/{id}/releases` | Return seats (capped at capacity), used for compensation |
+
+### Error format
+
+Every service returns structured errors with no stack traces:
+
+```json
+{
+  "status": 409,
+  "error": "Conflict",
+  "message": "not enough seats",
+  "path": "/api/bookings",
+  "timestamp": "2026-11-15T21:00:00Z"
+}
+```
+ 
+---
+
+## Service-to-service communication (OpenFeign)
+
+`booking-service` declares two Feign clients, located through Eureka by service name (there is no hard-coded URL and the calls don't go through the gateway):
+
+```java
+@FeignClient(name = "event-service")
+public interface EventClient { ... }        // /internal/events/...
+ 
+@FeignClient(name = "customer-service")
+public interface CustomerClient { ... }     // GET /api/customers/{id}
+```
+
+**Booking creation flow** (in `BookingServiceImpl`):
+
+```
+1. Validate the request (quantity 1..10)
+2. CustomerClient  → the customer must exist                 (404)
+3. EventClient GET → the event must exist and be PUBLISHED   (404 / 409)
+4. EventClient POST reservations → atomic seat reservation   (409 if not enough)
+5. Save the booking with a price snapshot
+   ↳ if the save fails: EventClient POST releases (compensation), then rethrow
+```
+
+- **Error mapping:** a custom `ErrorDecoder` turns remote `404` and `409` responses into domain exceptions. Connection errors and timeouts become `503`. A remote error is never turned into a success.
+- **Timeouts** (in `booking-service.yaml`): `connectTimeout: 2000 ms`, `readTimeout: 3000 ms`. There are no automatic retries on POST requests.
+- **No database transaction during remote calls:** `create()` doesn't hold a database connection while waiting on HTTP calls.
+### Atomic seat reservation
+
+`event-service` reserves seats with a single conditional SQL update:
+
+```sql
+UPDATE event
+SET available_seats = available_seats - :quantity
+WHERE id = :id AND status = 'PUBLISHED' AND available_seats >= :quantity
+```
+
+If no row is updated, the reservation is refused, so the seat count can never go negative. A concurrency test sends 30 parallel one-seat reservations against a 10-seat event: exactly 10 succeed.
+ 
+---
+
+## Databases
+
+One MySQL 8.4 server (container `mysql`) hosts one database per service. Each database has its own user, with privileges **only** on that database:
+
+| Database | Owner service | User |
+|---|---|---|
+| `customer_db` | customer-service | its own user |
+| `event_db` | event-service | its own user |
+| `booking_db` | booking-service | its own user |
+
+- The databases and users are created at the first start by `docker/mysql/init/01-create-databases.sh`, which reads passwords from the environment.
+- No service reads another service's database. Data from another domain is fetched through REST.
+- Schema management: Hibernate `ddl-auto: update`.
+- Data is stored in a named Docker volume and survives `docker compose down`.
+---
+
+## Docker setup
+
+Every service uses the same **two-stage Dockerfile** (`services/<service>/Dockerfile`, built from the repository root):
+
+1. **Build stage** (JDK 21 + Maven wrapper): copies the POMs first and resolves dependencies in a cached layer, then builds only this module with `./mvnw -pl services/<service> -am package -DskipTests`.
+2. **Run stage** (JRE 21 only): contains only the built jar, with no sources and no build tools.
+   Security and operations:
+
+- 🔒 **Non-root:** containers run as user `ticketflow` (UID/GID `10001`).
+- ❤️ **Health checks:** `HEALTHCHECK` on `/actuator/health`; Compose uses `depends_on: condition: service_healthy` to start services in order.
+- 📌 **Pinned base images**, no `latest`.
+- 🧠 **Container-aware JVM** (`-XX:MaxRAMPercentage`).
+- One internal Docker network. Only the gateway is exposed publicly.
+> When a new Maven module is added, every Dockerfile needs one extra `COPY` line for its `pom.xml`, because the Maven reactor needs all module POMs.
+ 
+---
+
+## Testing
+
+```bash
+./mvnw clean verify
+```
+
+- Tests run without Docker, the Config Server or MySQL. Each client has a test configuration file with no config import, and the tests use **H2**.
+- They include unit tests for the services (Mockito, with mocked Feign clients in booking-service), controller tests (MockMvc), and repository tests (including the concurrent seat reservation test).
+- booking-service tests cover: success, unknown customer, unknown event, event not published, not enough seats, event-service down (`503`), and compensation when the save fails.
+- CI runs the same command on GitHub Actions.
+---
+
+## Security notes
+
+- Secrets only live in `.env` (git-ignored). `.env.example` contains fake values.
+- The config repository contains **no** passwords or tokens, only placeholders.
+- MySQL and Eureka are bound to `127.0.0.1`. Config Server and business services aren't published at all.
+- Internal endpoints (`/internal/**`) aren't routed by the gateway.
+- Containers don't run as root.
+- Gateway routes are explicit. Discovery-based automatic routing is disabled, so a newly registered service isn't exposed automatically.
+---
+
+## Known limitations
+
+- **No authentication yet.** `customerId` is sent in the booking request body. It will come from the JWT once Keycloak is added.
+- **Reservation timeout gap.** If the reservation call times out *after* event-service has already reserved the seats, those seats aren't released. This will be handled by a saga or outbox approach.
+- **Bookings stay in `PENDING_PAYMENT`.** There is no payment service or booking expiry yet.
+- **`releases` isn't tied to a booking.** Any internal caller can return seats (up to capacity). It should become idempotent and linked to a booking ID.
+- **No circuit breaker yet.** Feign has timeouts, but Resilience4j isn't configured.
+- **Schema managed by Hibernate (`ddl-auto: update`).** Versioned migrations (Flyway) are recommended for production.
+---
+
+## Roadmap
+
+Based on the TicketFlow *cahier des charges*:
+
+- [x] API Gateway with explicit routes (TP1)
+- [x] Service discovery with Eureka (TP2)
+- [x] Centralized configuration with Config Server and GitHub (TP3)
+- [x] Customer, Event and Booking services
+- [x] OpenFeign communication between booking, event and customer services (TP4)
+- [x] Docker Compose, MySQL with one database per service, non-root containers, health checks
+- [ ] Resilience4j circuit breakers and bounded retries
+- [ ] Kafka domain events (`BookingCreated`, `BookingConfirmed`, …) and a Notification Service
+- [ ] Keycloak (OIDC/JWT): authentication, roles, identity from the token
+- [ ] Simulated Payment Service and Ticket Service
+- [ ] Booking expiry and cancellation
+- [ ] AI Assistant Service and MCP Tool Server, with a Telegram bot
+- [ ] Angular web front end
+- [ ] OpenAPI documentation and `/api/v1` versioning
+---
+
+## Author
+
+**Nabil Hilali**
+ 
