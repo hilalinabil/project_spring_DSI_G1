@@ -1,0 +1,113 @@
+# TicketFlow - full stack. Run from the repo root:
+#   cp .env.example .env   (then set real passwords)
+#   docker compose up -d --build
+# Published: gateway (8080), Eureka dashboard (8761), MySQL on 127.0.0.1:3306 only.
+# Business services are reachable only through the gateway.
+
+name: ticketflow
+
+x-java-service: &java-service
+  restart: unless-stopped
+  networks: [ticketflow]
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: ticketflow-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
+      CUSTOMER_DB_PASSWORD: ${CUSTOMER_DB_PASSWORD:?set CUSTOMER_DB_PASSWORD in .env}
+      EVENT_DB_PASSWORD: ${EVENT_DB_PASSWORD:?set EVENT_DB_PASSWORD in .env}
+      BOOKING_DB_PASSWORD: ${BOOKING_DB_PASSWORD:?set BOOKING_DB_PASSWORD in .env}
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./docker/mysql/init:/docker-entrypoint-initdb.d:ro
+    # Published on the loopback interface ONLY (not reachable from the LAN), so a
+    # service can also run outside Docker with ./mvnw spring-boot:run.
+    ports:
+      - "127.0.0.1:3306:3306"
+    healthcheck:
+      # TCP (127.0.0.1), not the socket: the temporary init server runs with
+      # --skip-networking, so this only succeeds once the real server is up.
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 10
+    networks: [ticketflow]
+
+  config-server:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: services/config-server/Dockerfile
+    image: ticketflow/config-server:local
+    container_name: ticketflow-config-server
+    environment:
+      CONFIG_GIT_URI: ${CONFIG_GIT_URI:?set CONFIG_GIT_URI in .env}
+      CONFIG_GIT_USERNAME: ${CONFIG_GIT_USERNAME:-}
+      CONFIG_GIT_TOKEN: ${CONFIG_GIT_TOKEN:-}
+
+  discovery-server:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: services/discovery-server/Dockerfile
+    image: ticketflow/discovery-server:local
+    container_name: ticketflow-discovery-server
+    ports:
+      - "8761:8761"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      config-server:
+        condition: service_healthy
+
+  customer-service:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: services/customer-service/Dockerfile
+    image: ticketflow/customer-service:local
+    container_name: ticketflow-customer-service
+    environment:
+      # Its local application.yml is frozen and hard-codes a localhost import.
+      # Imports are processed per file, so SPRING_CONFIG_IMPORT alone would ADD
+      # an import and the file's localhost one would still fail. Instead, skip
+      # the packaged application.yml (empty config location) and give its
+      # three settings here. Everything else comes from the config repo.
+      SPRING_CONFIG_LOCATION: optional:file:/app/config/
+      SPRING_APPLICATION_NAME: customer-service
+      SPRING_CLOUD_CONFIG_LABEL: main
+      SPRING_CONFIG_IMPORT: configserver:http://config-server:8888
+      EUREKA_URL: http://discovery-server:8761/eureka/
+      DB_HOST: mysql
+      DB_USERNAME: customer_user
+      DB_PASSWORD: ${CUSTOMER_DB_PASSWORD}
+    depends_on:
+      discovery-server:
+        condition: service_healthy
+
+  api-gateway:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: services/api-gateway/Dockerfile
+    image: ticketflow/api-gateway:local
+    container_name: ticketflow-api-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_URL: http://discovery-server:8761/eureka/
+    depends_on:
+      customer-service:
+        condition: service_healthy
+
+networks:
+  ticketflow:
+    name: ticketflow
+
+volumes:
+  mysql-data:
