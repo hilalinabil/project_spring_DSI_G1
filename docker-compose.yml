@@ -1,7 +1,7 @@
 # TicketFlow - full stack. Run from the repo root:
 #   cp .env.example .env   (then set real passwords)
 #   docker compose up -d --build
-# Published: gateway (8080), Eureka dashboard (8761), MySQL on 127.0.0.1:3306 only.
+# Published: gateway (8080); Eureka dashboard (8761) and MySQL (3306) on 127.0.0.1 only.
 # Business services are reachable only through the gateway.
 
 name: ticketflow
@@ -57,7 +57,7 @@ services:
     image: ticketflow/discovery-server:local
     container_name: ticketflow-discovery-server
     ports:
-      - "8761:8761"
+      - "127.0.0.1:8761:8761"
     depends_on:
       mysql:
         condition: service_healthy
