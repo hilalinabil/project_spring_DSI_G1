@@ -1,0 +1,17 @@
+# Test copy of src/main/resources/application.yaml (same name, so it replaces it
+# on the test classpath). Tests run without a Config Server, Eureka, MySQL or the
+# remote services: no configserver: import here, H2 in-memory (test scope),
+# values inlined. Feign clients are mocked in the unit tests.
+spring:
+  application:
+    name: booking-service
+  cloud:
+    config:
+      enabled: false
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: create-drop
+eureka:
+  client:
+    enabled: false

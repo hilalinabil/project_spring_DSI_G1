@@ -10,11 +10,12 @@ WORKDIR /workspace
 COPY mvnw ./
 COPY .mvn/ .mvn/
 COPY pom.xml ./
-COPY services/config-server/pom.xml    services/config-server/
-COPY services/discovery-server/pom.xml services/discovery-server/
-COPY services/api-gateway/pom.xml      services/api-gateway/
-COPY services/customer-service/pom.xml services/customer-service/
-COPY services/event-service/pom.xml    services/event-service/
+COPY services/config-server/pom.xml     services/config-server/
+COPY services/discovery-server/pom.xml  services/discovery-server/
+COPY services/api-gateway/pom.xml       services/api-gateway/
+COPY services/customer-service/pom.xml  services/customer-service/
+COPY services/event-service/pom.xml     services/event-service/
+COPY services/booking-service/pom.xml   services/booking-service/
 
 # Dependencies in their own layer: only re-downloaded when a POM changes.
 RUN ./mvnw -B -ntp -pl services/customer-service -am dependency:go-offline

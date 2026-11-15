@@ -110,6 +110,32 @@ services:
       discovery-server:
         condition: service_healthy
 
+  booking-service:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: services/booking-service/Dockerfile
+    image: ticketflow/booking-service:local
+    container_name: ticketflow-booking-service
+    environment:
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_URL: http://discovery-server:8761/eureka/
+      DB_HOST: mysql
+      DB_USERNAME: booking_user
+      DB_PASSWORD: ${BOOKING_DB_PASSWORD}
+    # Calls event-service and customer-service (OpenFeign, through Eureka).
+    depends_on:
+      mysql:
+        condition: service_healthy
+      config-server:
+        condition: service_healthy
+      discovery-server:
+        condition: service_healthy
+      event-service:
+        condition: service_healthy
+      customer-service:
+        condition: service_healthy
+
   api-gateway:
     <<: *java-service
     build:
