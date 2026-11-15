@@ -27,8 +27,10 @@ RUN ./mvnw -B -ntp -pl services/customer-service -am package -DskipTests
 FROM eclipse-temurin:21.0.9_10-jre-noble
 
 # Dedicated non-root user (fixed UID/GID; 1000 is already taken by "ubuntu").
+# It gets a home directory: some libraries (e.g. JGit in config-server) write
+# their settings under $HOME.
 RUN groupadd --system --gid 10001 ticketflow \
- && useradd --system --uid 10001 --gid ticketflow --no-create-home --shell /usr/sbin/nologin ticketflow
+ && useradd --system --uid 10001 --gid ticketflow --create-home --home-dir /home/ticketflow --shell /usr/sbin/nologin ticketflow
 
 WORKDIR /app
 COPY --from=build --chown=ticketflow:ticketflow /workspace/services/customer-service/target/customer-service-*.jar app.jar
