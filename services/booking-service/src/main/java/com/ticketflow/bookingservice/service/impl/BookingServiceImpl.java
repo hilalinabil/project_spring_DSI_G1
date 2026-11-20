@@ -20,9 +20,12 @@ import com.ticketflow.bookingservice.mapper.BookingMapper;
 import com.ticketflow.bookingservice.repository.BookingRepository;
 import com.ticketflow.bookingservice.service.BookingService;
 import feign.RetryableException;
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Supplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.cloud.client.circuitbreaker.NoFallbackAvailableException;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
@@ -97,7 +100,7 @@ public class BookingServiceImpl implements BookingService {
             Booking saved = repository.save(new Booking(customerId, eventId, quantity, event.price()));
             return mapper.toResponse(saved);
         } catch (RuntimeException saveFailure) {
-            releaseSeats(eventId, quantity, saveFailure);
+            releaseSeats(customerId, eventId, quantity, saveFailure);
             throw saveFailure;
         }
     }
@@ -117,28 +120,64 @@ public class BookingServiceImpl implements BookingService {
         return mapper.toPageResponse(repository.findByCustomerId(customerId, pageable));
     }
 
-    /** Compensation: never hides the original failure, even if the release fails too. */
-    private void releaseSeats(Long eventId, int quantity, RuntimeException cause) {
+    /**
+     * Compensation: never hides the original failure, even if the release fails too.
+     * The booking was NOT saved, so there is no booking id: the log carries
+     * customer, event and quantity instead. A release rejected by an OPEN
+     * circuit is never sent: the seats stay reserved until released by hand
+     * (known limitation, fixed by the future saga).
+     */
+    private void releaseSeats(Long customerId, Long eventId, int quantity, RuntimeException cause) {
         try {
             remote(EVENT_SERVICE, () -> eventClient.releaseSeats(eventId, new SeatsRequest(quantity)));
             log.warn("Booking not saved, released {} seat(s) of event {}", quantity, eventId);
         } catch (RuntimeException releaseFailure) {
-            log.error("Booking not saved AND releasing {} seat(s) of event {} failed: seats leaked",
-                    quantity, eventId, releaseFailure);
+            if (releaseFailure.getCause() instanceof CallNotPermittedException) {
+                log.error("COMPENSATION NOT SENT: circuit breaker '{}' is OPEN. Booking not saved "
+                                + "(no booking id) for customer {}; {} seat(s) of event {} stay reserved: "
+                                + "release them manually", EVENT_SERVICE, customerId, quantity, eventId);
+            } else {
+                log.error("Booking not saved AND releasing {} seat(s) of event {} (customer {}) failed: "
+                        + "seats leaked", quantity, eventId, customerId, releaseFailure);
+            }
             cause.addSuppressed(releaseFailure);
         }
     }
 
     /**
-     * Connection refused, unknown host, connect or read timeout: Feign throws a
-     * RetryableException (never retried: Feign's default Retryer.NEVER_RETRY),
-     * which means the dependency is unavailable -> 503.
+     * Every Feign call runs inside the client's circuit breaker (one per client,
+     * see FeignCircuitBreakerConfig). With no Feign fallback, Spring Cloud wraps
+     * whatever went wrong in a NoFallbackAvailableException: unwrap it so the
+     * callers see our own exceptions, then translate the technical ones to 503.
+     * <ul>
+     *   <li>CallNotPermittedException: circuit OPEN, no request was sent;</li>
+     *   <li>RetryableException: connection refused, unknown host, connect or read
+     *       timeout (never retried: Feign's default Retryer.NEVER_RETRY);</li>
+     *   <li>TimeoutException: the circuit breaker's time limiter gave up.</li>
+     * </ul>
+     * RemoteNotFoundException / RemoteConflictException (404 / 409) are rethrown
+     * as is: they are business answers, handled by the callers.
      */
     private static <T> T remote(String service, Supplier<T> call) {
         try {
             return call.get();
-        } catch (RetryableException e) {
-            throw new ServiceUnavailableException(service, e);
+        } catch (NoFallbackAvailableException e) {
+            throw translate(service, e.getCause() != null ? e.getCause() : e);
+        } catch (RuntimeException e) {
+            throw translate(service, e);
         }
+    }
+
+    private static RuntimeException translate(String service, Throwable failure) {
+        if (failure instanceof CallNotPermittedException) {
+            return ServiceUnavailableException.circuitOpen(service, failure);
+        }
+        if (failure instanceof RetryableException || failure instanceof TimeoutException) {
+            return new ServiceUnavailableException(service, failure);
+        }
+        if (failure instanceof RuntimeException runtime) {
+            return runtime;
+        }
+        return new IllegalStateException(service + " call failed", failure);
     }
 }

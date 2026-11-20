@@ -18,6 +18,12 @@ import com.ticketflow.bookingservice.exception.EventNotBookableException;
 import com.ticketflow.bookingservice.exception.NotEnoughSeatsException;
 import com.ticketflow.bookingservice.exception.ServiceUnavailableException;
 import com.ticketflow.bookingservice.service.BookingService;
+import feign.Request;
+import feign.RetryableException;
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.List;
@@ -109,6 +115,30 @@ class BookingControllerTest {
                 .andExpect(status().isServiceUnavailable())
                 .andExpect(jsonPath("$.message").value("event-service is unavailable, try again later"))
                 .andExpect(jsonPath("$.trace").doesNotExist());
+    }
+
+    @Test
+    void openCircuitEscapingTheServiceIs503() throws Exception {
+        when(service.create(any())).thenThrow(
+                CallNotPermittedException.createCallNotPermittedException(CircuitBreaker.ofDefaults("event-service")));
+
+        mockMvc.perform(post("/api/bookings").contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(jsonPath("$.status").value(503))
+                .andExpect(jsonPath("$.message")
+                        .value("event-service is unavailable (circuit breaker open), try again later"));
+    }
+
+    @Test
+    void connectionErrorEscapingTheServiceIs503() throws Exception {
+        Request request = Request.create(Request.HttpMethod.GET, "http://event-service/internal/events/42",
+                Map.of(), null, StandardCharsets.UTF_8, null);
+        when(service.create(any())).thenThrow(new RetryableException(-1, "Connection refused",
+                Request.HttpMethod.GET, (Long) null, request));
+
+        mockMvc.perform(post("/api/bookings").contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(jsonPath("$.message").value("a remote service is unavailable, try again later"));
     }
 
     @Test

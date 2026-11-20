@@ -472,7 +472,8 @@ Security and operations:
 - **Reservation timeout gap.** If the reservation call times out *after* event-service has already reserved the seats, those seats aren't released. This will be handled by a saga or outbox approach.
 - **Bookings stay in `PENDING_PAYMENT`.** There is no payment service or booking expiry yet.
 - **`releases` isn't tied to a booking.** Any internal caller can return seats (up to capacity). It should become idempotent and linked to a booking ID.
-- **No circuit breaker yet.** Feign has timeouts, but Resilience4j isn't configured.
+- **Compensation can be rejected by an open circuit.** If saving a booking fails after the seats were reserved, booking-service calls `releases` to give them back. If the `event-service` circuit breaker is OPEN at that moment, the release is never sent: the seats stay reserved. booking-service logs it as `COMPENSATION NOT SENT ... seat(s) of event N stay reserved: release them manually` (customer, event and quantity; there is no booking ID because the booking was not saved). The future saga step will retry the release from a durable record.
+- **No retries.** A failed call is never retried (a `POST` reservation must not be sent twice). Bounded, idempotent retries come with the saga.
 - **Schema managed by Hibernate (`ddl-auto: update`).** Versioned migrations (Flyway) are recommended for production.
 
 ---
@@ -487,7 +488,8 @@ Based on the TicketFlow *cahier des charges*:
 - [x] Customer, Event and Booking services
 - [x] OpenFeign communication between booking, event and customer services (TP4)
 - [x] Docker Compose, MySQL with one database per service, non-root containers, health checks
-- [ ] Resilience4j circuit breakers and bounded retries
+- [x] Resilience4j circuit breakers, one per Feign client (TP5)
+- [ ] Bounded, idempotent retries
 - [ ] Kafka domain events (`BookingCreated`, `BookingConfirmed`, …) and a Notification Service
 - [ ] Keycloak (OIDC/JWT): authentication, roles, identity from the token
 - [ ] Simulated Payment Service and Ticket Service

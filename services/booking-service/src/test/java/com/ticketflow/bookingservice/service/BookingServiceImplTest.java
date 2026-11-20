@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -32,6 +33,8 @@ import com.ticketflow.bookingservice.repository.BookingRepository;
 import com.ticketflow.bookingservice.service.impl.BookingServiceImpl;
 import feign.Request;
 import feign.RetryableException;
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
@@ -41,6 +44,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.cloud.client.circuitbreaker.NoFallbackAvailableException;
 import org.springframework.dao.DataAccessResourceFailureException;
 
 @ExtendWith(MockitoExtension.class)
@@ -72,6 +76,17 @@ class BookingServiceImplTest {
         Request request = Request.create(Request.HttpMethod.GET, "http://event-service/internal/events/42",
                 Map.of(), null, StandardCharsets.UTF_8, null);
         return new RetryableException(-1, "Connection refused", Request.HttpMethod.GET, (Long) null, request);
+    }
+
+    /** What a Feign client throws when its circuit breaker is OPEN (no Feign fallback). */
+    private static NoFallbackAvailableException circuitOpen(String service) {
+        return new NoFallbackAvailableException("No fallback available.",
+                CallNotPermittedException.createCallNotPermittedException(CircuitBreaker.ofDefaults(service)));
+    }
+
+    /** What a Feign client throws when the call itself failed inside the breaker. */
+    private static NoFallbackAvailableException wrapped(Throwable cause) {
+        return new NoFallbackAvailableException("No fallback available.", cause);
     }
 
     private void customerExists() {
@@ -196,6 +211,75 @@ class BookingServiceImplTest {
         assertThatThrownBy(() -> service.create(REQUEST))
                 .isSameAs(dbDown)
                 .satisfies(e -> assertThat(e.getSuppressed()).hasSize(1));
+    }
+
+    @Test
+    void businessAnswersWrappedByTheCircuitBreakerKeepTheirMeaning() {
+        customerExists();
+        when(eventClient.getEvent(EVENT_ID)).thenThrow(wrapped(new RemoteNotFoundException("event-service")));
+        assertThatThrownBy(() -> service.create(REQUEST)).isInstanceOf(EventNotFoundException.class);
+
+        // doReturn: when(...) would invoke the stub, which now throws.
+        doReturn(event("PUBLISHED", 2)).when(eventClient).getEvent(EVENT_ID);
+        when(eventClient.reserveSeats(EVENT_ID, new SeatsRequest(3)))
+                .thenThrow(wrapped(new RemoteConflictException("event-service")));
+        assertThatThrownBy(() -> service.create(REQUEST)).isInstanceOf(NotEnoughSeatsException.class);
+        verifyNoInteractions(repository);
+    }
+
+    @Test
+    void technicalFailuresWrappedByTheCircuitBreakerAre503() {
+        customerExists();
+        when(eventClient.getEvent(EVENT_ID)).thenThrow(wrapped(connectionRefused()))
+                .thenThrow(wrapped(new java.util.concurrent.TimeoutException("time limiter")))
+                .thenThrow(wrapped(new ServiceUnavailableException("event-service")));
+
+        for (int i = 0; i < 3; i++) {
+            assertThatThrownBy(() -> service.create(REQUEST))
+                    .isInstanceOf(ServiceUnavailableException.class)
+                    .hasMessage("event-service is unavailable, try again later");
+        }
+        verifyNoInteractions(repository);
+    }
+
+    @Test
+    void openCircuitIs503AndNothingIsReservedOrSaved() {
+        customerExists();
+        when(eventClient.getEvent(EVENT_ID)).thenThrow(circuitOpen("event-service"));
+
+        assertThatThrownBy(() -> service.create(REQUEST))
+                .isInstanceOf(ServiceUnavailableException.class)
+                .hasMessage("event-service is unavailable (circuit breaker open), try again later")
+                .hasCauseInstanceOf(CallNotPermittedException.class);
+        verify(eventClient, never()).reserveSeats(anyLong(), any());
+        verifyNoInteractions(repository);
+    }
+
+    @Test
+    void openCustomerCircuitIs503AndEventServiceIsNotCalled() {
+        when(customerClient.getCustomer(CUSTOMER_ID)).thenThrow(circuitOpen("customer-service"));
+
+        assertThatThrownBy(() -> service.create(REQUEST))
+                .isInstanceOf(ServiceUnavailableException.class)
+                .hasMessage("customer-service is unavailable (circuit breaker open), try again later");
+        verifyNoInteractions(eventClient, repository);
+    }
+
+    @Test
+    void compensationRejectedByOpenCircuitKeepsOriginalError() {
+        customerExists();
+        when(eventClient.getEvent(EVENT_ID)).thenReturn(event("PUBLISHED", 100));
+        when(eventClient.reserveSeats(EVENT_ID, new SeatsRequest(3))).thenReturn(event("PUBLISHED", 97));
+        DataAccessResourceFailureException dbDown = new DataAccessResourceFailureException("db down");
+        when(repository.save(any(Booking.class))).thenThrow(dbDown);
+        when(eventClient.releaseSeats(eq(EVENT_ID), any())).thenThrow(circuitOpen("event-service"));
+
+        assertThatThrownBy(() -> service.create(REQUEST))
+                .isSameAs(dbDown)
+                .satisfies(e -> assertThat(e.getSuppressed()).singleElement()
+                        .isInstanceOf(ServiceUnavailableException.class)
+                        .extracting(Throwable::getCause)
+                        .isInstanceOf(CallNotPermittedException.class));
     }
 
     @Test

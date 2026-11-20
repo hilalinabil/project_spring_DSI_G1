@@ -1,5 +1,7 @@
 package com.ticketflow.bookingservice.exception;
 
+import feign.RetryableException;
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
 import jakarta.servlet.http.HttpServletRequest;
 import java.time.Instant;
 import java.util.stream.Collectors;
@@ -44,6 +46,24 @@ public class GlobalExceptionHandler {
         log.warn("{} {}: {}", request.getMethod(), request.getRequestURI(), ex.getMessage(),
                 ex.getCause());
         return build(HttpStatus.SERVICE_UNAVAILABLE, ex.getMessage(), request);
+    }
+
+    /**
+     * Safety net: the service layer already turns these into
+     * ServiceUnavailableException, but a remote call that escapes it must
+     * still give a 503, never a 500.
+     */
+    @ExceptionHandler(CallNotPermittedException.class)
+    ResponseEntity<ErrorResponse> circuitOpen(CallNotPermittedException ex, HttpServletRequest request) {
+        log.warn("{} {}: {}", request.getMethod(), request.getRequestURI(), ex.getMessage());
+        return build(HttpStatus.SERVICE_UNAVAILABLE, ex.getCausingCircuitBreakerName()
+                + " is unavailable (circuit breaker open), try again later", request);
+    }
+
+    @ExceptionHandler(RetryableException.class)
+    ResponseEntity<ErrorResponse> connectionError(RetryableException ex, HttpServletRequest request) {
+        log.warn("{} {}: {}", request.getMethod(), request.getRequestURI(), ex.getMessage());
+        return build(HttpStatus.SERVICE_UNAVAILABLE, "a remote service is unavailable, try again later", request);
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
