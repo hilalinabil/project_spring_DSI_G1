@@ -6,6 +6,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -16,6 +17,7 @@ import com.ticketflow.bookingservice.client.EventClient;
 import com.ticketflow.bookingservice.client.dto.CustomerResponse;
 import com.ticketflow.bookingservice.client.dto.EventResponse;
 import com.ticketflow.bookingservice.client.dto.SeatsRequest;
+import com.ticketflow.bookingservice.dto.BookingCreatedEvent;
 import com.ticketflow.bookingservice.dto.BookingRequest;
 import com.ticketflow.bookingservice.dto.BookingResponse;
 import com.ticketflow.bookingservice.entity.Booking;
@@ -42,6 +44,7 @@ import java.util.Optional;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.cloud.client.circuitbreaker.NoFallbackAvailableException;
@@ -60,12 +63,14 @@ class BookingServiceImplTest {
     EventClient eventClient;
     @Mock
     CustomerClient customerClient;
+    @Mock
+    BookingEventPublisher publisher;
 
     BookingServiceImpl service;
 
     @BeforeEach
     void setUp() {
-        service = new BookingServiceImpl(repository, new BookingMapper(), eventClient, customerClient);
+        service = new BookingServiceImpl(repository, new BookingMapper(), eventClient, customerClient, publisher);
     }
 
     private static EventResponse event(String status, int availableSeats) {
@@ -280,6 +285,69 @@ class BookingServiceImplTest {
                         .isInstanceOf(ServiceUnavailableException.class)
                         .extracting(Throwable::getCause)
                         .isInstanceOf(CallNotPermittedException.class));
+    }
+
+    private void bookingCanBeSaved() {
+        customerExists();
+        when(eventClient.getEvent(EVENT_ID)).thenReturn(event("PUBLISHED", 100));
+        when(eventClient.reserveSeats(EVENT_ID, new SeatsRequest(3))).thenReturn(event("PUBLISHED", 97));
+        when(repository.save(any(Booking.class))).thenAnswer(inv -> {
+            Booking booking = inv.getArgument(0);
+            org.springframework.test.util.ReflectionTestUtils.setField(booking, "id", 55L);
+            return booking;
+        });
+    }
+
+    @Test
+    void createPublishesBookingCreatedAfterSave() {
+        bookingCanBeSaved();
+
+        service.create(REQUEST);
+
+        ArgumentCaptor<BookingCreatedEvent> captor = ArgumentCaptor.forClass(BookingCreatedEvent.class);
+        var inOrder = org.mockito.Mockito.inOrder(repository, publisher);
+        inOrder.verify(repository).save(any(Booking.class));
+        inOrder.verify(publisher).publishCreated(captor.capture());
+        BookingCreatedEvent event = captor.getValue();
+        assertThat(event.eventId()).isNotNull();
+        assertThat(event.type()).isEqualTo("BookingCreated");
+        assertThat(event.version()).isEqualTo(1);
+        assertThat(event.occurredAt()).isNotNull();
+        assertThat(event.payload()).isEqualTo(new BookingCreatedEvent.Payload(
+                55L, EVENT_ID, CUSTOMER_ID, 3, new BigDecimal("450.00")));
+    }
+
+    @Test
+    void createStillSucceedsWhenPublishingFails() {
+        bookingCanBeSaved();
+        doThrow(new IllegalStateException("broker down")).when(publisher).publishCreated(any());
+
+        BookingResponse response = service.create(REQUEST);
+
+        assertThat(response.id()).isEqualTo(55L);
+        verify(eventClient, never()).releaseSeats(anyLong(), any());
+    }
+
+    @Test
+    void nothingIsPublishedWhenTheBookingIsNotSaved() {
+        customerExists();
+        when(eventClient.getEvent(EVENT_ID)).thenReturn(event("PUBLISHED", 100));
+        when(eventClient.reserveSeats(EVENT_ID, new SeatsRequest(3))).thenReturn(event("PUBLISHED", 97));
+        when(repository.save(any(Booking.class))).thenThrow(new DataAccessResourceFailureException("db down"));
+
+        assertThatThrownBy(() -> service.create(REQUEST)).isInstanceOf(DataAccessResourceFailureException.class);
+        verifyNoInteractions(publisher);
+    }
+
+    @Test
+    void nothingIsPublishedOnBusinessOrTechnicalErrors() {
+        customerExists();
+        when(eventClient.getEvent(EVENT_ID)).thenThrow(new RemoteNotFoundException("event-service"));
+        assertThatThrownBy(() -> service.create(REQUEST)).isInstanceOf(EventNotFoundException.class);
+
+        doThrow(circuitOpen("event-service")).when(eventClient).getEvent(EVENT_ID);
+        assertThatThrownBy(() -> service.create(REQUEST)).isInstanceOf(ServiceUnavailableException.class);
+        verifyNoInteractions(publisher);
     }
 
     @Test

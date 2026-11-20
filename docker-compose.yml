@@ -192,6 +192,7 @@ services:
       DB_PASSWORD: ${BOOKING_DB_PASSWORD}
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     # Calls event-service and customer-service (OpenFeign, through Eureka).
+    # Publishes to Kafka but does NOT depend on it: bookings work without it.
     depends_on:
       mysql:
         condition: service_healthy
@@ -203,6 +204,31 @@ services:
         condition: service_healthy
       customer-service:
         condition: service_healthy
+
+  # Kafka consumer of ticketflow.booking.created. No HTTP API, not routed by
+  # the gateway, port not published. Needs the broker AND the topics, unlike
+  # booking-service, which deliberately has no depends_on on kafka: a Kafka
+  # outage must not stop bookings.
+  notification-service:
+    <<: *java-service
+    build:
+      context: .
+      dockerfile: services/notification-service/Dockerfile
+    image: ticketflow/notification-service:local
+    container_name: ticketflow-notification-service
+    environment:
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_URL: http://discovery-server:8761/eureka/
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      config-server:
+        condition: service_healthy
+      discovery-server:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
 
   api-gateway:
     <<: *java-service

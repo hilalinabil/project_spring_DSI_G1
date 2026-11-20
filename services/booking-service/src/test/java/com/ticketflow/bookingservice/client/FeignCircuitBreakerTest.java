@@ -9,6 +9,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import com.ticketflow.bookingservice.repository.BookingRepository;
+import com.ticketflow.bookingservice.service.BookingEventPublisher;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker.State;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
@@ -29,6 +30,7 @@ import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 
@@ -84,6 +86,9 @@ class FeignCircuitBreakerTest {
     TimeLimiterRegistry timeLimiters;
     @Autowired
     BookingRepository repository;
+    /** No broker in this test: publishing is covered by KafkaBookingEventPublisherTest. */
+    @MockitoBean
+    BookingEventPublisher publisher;
 
     CircuitBreaker eventBreaker;
     CircuitBreaker customerBreaker;

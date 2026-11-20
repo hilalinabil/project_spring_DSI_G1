@@ -18,6 +18,7 @@ import com.ticketflow.bookingservice.exception.RemoteNotFoundException;
 import com.ticketflow.bookingservice.exception.ServiceUnavailableException;
 import com.ticketflow.bookingservice.mapper.BookingMapper;
 import com.ticketflow.bookingservice.repository.BookingRepository;
+import com.ticketflow.bookingservice.service.BookingEventPublisher;
 import com.ticketflow.bookingservice.service.BookingService;
 import feign.RetryableException;
 import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
@@ -45,13 +46,16 @@ public class BookingServiceImpl implements BookingService {
     private final BookingMapper mapper;
     private final EventClient eventClient;
     private final CustomerClient customerClient;
+    private final BookingEventPublisher publisher;
 
     public BookingServiceImpl(BookingRepository repository, BookingMapper mapper,
-                              EventClient eventClient, CustomerClient customerClient) {
+                              EventClient eventClient, CustomerClient customerClient,
+                              BookingEventPublisher publisher) {
         this.repository = repository;
         this.mapper = mapper;
         this.eventClient = eventClient;
         this.customerClient = customerClient;
+        this.publisher = publisher;
     }
 
     /**
@@ -96,12 +100,26 @@ public class BookingServiceImpl implements BookingService {
         }
 
         // 4. Persist with the price snapshot; give the seats back if that fails.
+        Booking saved;
         try {
-            Booking saved = repository.save(new Booking(customerId, eventId, quantity, event.price()));
-            return mapper.toResponse(saved);
+            saved = repository.save(new Booking(customerId, eventId, quantity, event.price()));
         } catch (RuntimeException saveFailure) {
             releaseSeats(customerId, eventId, quantity, saveFailure);
             throw saveFailure;
+        }
+
+        // 5. Announce it, only once it is committed (save ran in its own
+        //    transaction). Outside the try above: a publish problem must never
+        //    release the seats of a saved booking, nor fail the request.
+        publishCreated(saved);
+        return mapper.toResponse(saved);
+    }
+
+    private void publishCreated(Booking saved) {
+        try {
+            publisher.publishCreated(mapper.toCreatedEvent(saved));
+        } catch (RuntimeException e) {
+            log.error("BookingCreated NOT published for booking {}: {}", saved.getId(), e.toString());
         }
     }
 

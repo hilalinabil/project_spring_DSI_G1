@@ -1,0 +1,19 @@
+# Test copy of src/main/resources/application.yaml: no Config Server, no Eureka.
+# The broker is an embedded one (@EmbeddedKafka sets spring.kafka.bootstrap-servers).
+# Kafka consumer settings: same values as notification-service.yaml in the config repo.
+spring:
+  application:
+    name: notification-service
+  cloud:
+    config:
+      enabled: false
+  kafka:
+    consumer:
+      auto-offset-reset: earliest
+eureka:
+  client:
+    enabled: false
+ticketflow:
+  kafka:
+    topics:
+      booking-created: ticketflow.booking.created

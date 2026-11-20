@@ -1,0 +1,11 @@
+# Everything else (port, Kafka consumer, topic names, actuator) comes from
+# notification-service.yaml in the ticketFlow-config repo. No optional: the
+# service refuses to start without the config server.
+spring:
+  application:
+    name: notification-service
+  config:
+    import: "configserver:${CONFIG_SERVER_URL:http://localhost:8888}"
+  cloud:
+    config:
+      label: main

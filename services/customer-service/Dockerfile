@@ -16,6 +16,7 @@ COPY services/api-gateway/pom.xml       services/api-gateway/
 COPY services/customer-service/pom.xml  services/customer-service/
 COPY services/event-service/pom.xml     services/event-service/
 COPY services/booking-service/pom.xml   services/booking-service/
+COPY services/notification-service/pom.xml services/notification-service/
 
 # Dependencies in their own layer: only re-downloaded when a POM changes.
 RUN ./mvnw -B -ntp -pl services/customer-service -am dependency:go-offline

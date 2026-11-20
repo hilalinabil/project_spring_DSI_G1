@@ -25,6 +25,19 @@ spring:
         enabled: true
         group:
           enabled: true
+  # No broker in the tests (publisher mocked or KafkaTemplate mocked). Same
+  # producer settings as the config repo; max.block.ms keeps an accidental
+  # send from hanging.
+  kafka:
+    bootstrap-servers: localhost:9094
+    producer:
+      client-id: booking-service
+      acks: all
+      properties:
+        enable.idempotence: true
+        max.block.ms: 2000
+        request.timeout.ms: 5000
+        delivery.timeout.ms: 10000
   jpa:
     open-in-view: false
     hibernate:
@@ -36,6 +49,10 @@ management:
   endpoint:
     health:
       show-details: always
+ticketflow:
+  kafka:
+    topics:
+      booking-created: ticketflow.booking.created
 resilience4j:
   circuitbreaker:
     configs:
